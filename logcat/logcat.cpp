@@ -19,9 +19,14 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <arpa/inet.h>
+#include <sys/klog.h>
 
 #define DEFAULT_LOG_ROTATE_SIZE_KBYTES 16
 #define DEFAULT_MAX_ROTATED_LOGS 4
+//For redirecting kernel message into logcat
+#define KERNEL_TAG "kernel"
+#define KLOG_BUF_SHIFT  17  /* CONFIG_LOG_BUF_SHIFT from our kernel */
+#define KLOG_BUF_LEN    (1 << KLOG_BUF_SHIFT)
 
 static AndroidLogFormat * g_logformat;
 static bool g_nonblock = false;
@@ -247,7 +252,143 @@ static void printNextEntry(log_device_t* dev) {
     skipNextEntry(dev);
 }
 
-static void readLogLines(log_device_t* devices)
+static double getPoweronTime()
+{
+    double uptime = 0;
+    double idle_time = 0;
+    char buf[256] = {0};
+    FILE *fp = NULL;
+    struct timeval now;
+
+    fp = fopen("/proc/uptime", "r");
+
+    if ( NULL == fp ) {
+        perror("fopen /proc/uptime");
+        return -1;
+    }
+
+    fscanf(fp, "%lf %lf", &uptime, &idle_time);
+
+    if (ferror(fp) != 0) {
+        fclose(fp);
+        return -1;
+    }
+
+    fclose(fp);
+
+    if (gettimeofday(&now, NULL) != 0) {
+        return -1;
+    }
+
+    return (now.tv_sec + now.tv_usec / 1000000.0 - uptime);
+}
+
+static void parseTimeFromKernelMessage(queued_entry_t* entry, char * __attribute__((aligned(4))) buf)
+{
+    char *p = NULL;
+    char *q = NULL;
+    char *dot = NULL;
+    static double when_poweron = 0;
+    double time_stamp = 0;
+    const int sec_to_nano_converter = 1000000000;
+
+    if (NULL == buf || NULL == entry) {
+        return;
+    }
+
+    if ( 0 == when_poweron) {
+        when_poweron = getPoweronTime();
+    }
+
+    if ( when_poweron < 0 ) {
+        //Failed to get power on time, so cannot calc time stamp for kernel msg
+        return;
+    }
+
+    // Try to get time from the buf. Expect buf style like below:
+    // <?>[1234.5678]abcdefghijklmn
+    if ( (p = strchr(buf, '[')) != NULL && ( q = strchr(buf, ']')) != NULL) {
+        *q = '\0';
+
+        if ( (dot = strchr(p, '.')) != NULL) {
+            time_stamp = atof(p + 1) + when_poweron;
+            entry->entry.sec = (int32_t) time_stamp;
+            entry->entry.nsec = (int32_t) ((time_stamp - entry->entry.sec)
+                                           * sec_to_nano_converter);
+        }
+
+        *q = ']';
+    }
+}
+
+static int importKernelMessage(log_device_t* dev, bool print_all)
+{
+    int ret = 0;
+    char __attribute__((aligned(4))) *begin = NULL;
+    char __attribute__((aligned(4))) *end = NULL;
+    char buffer[KLOG_BUF_LEN + 1] __attribute__((aligned(4)));
+    int queued_lines = 0;
+    unsigned int oneline_len = 0;
+
+    //In order to make kernel ring buffer act like logcat ring buffer, the log
+    //buffer always need to be read and cleared.
+    if (klogctl(KLOG_UNREADSIZE, NULL, 0) > 0) {
+        ret = klogctl(KLOG_READ, buffer, KLOG_BUF_LEN);
+    }
+
+    //Discard msg from log buffer when full msg in kernel ring buffer is need.
+    if (print_all) {
+        ret = klogctl(KLOG_READ_ALL, buffer, KLOG_BUF_LEN);
+    }
+
+    if ( -1 == ret ) {
+        perror("klogctl");
+        return 0;
+    }
+
+    if ( 0 == ret ) {
+        return 0;
+    }
+
+    buffer[ret] = '\0';
+    begin = buffer;
+
+    do {
+        end = strchr(begin, '\n');
+        if ( NULL != end ) {
+            *end = '\0';
+        }
+        oneline_len = strlen(begin);
+
+        queued_entry_t* entry = new queued_entry_t();
+        //Fill the entry as logcat expected.
+        entry->entry.tid = pthread_self();
+        entry->entry.pid = getpid();
+        entry->entry.msg[0] = ANDROID_LOG_VERBOSE;
+        parseTimeFromKernelMessage(entry, begin);
+        strcpy(entry->entry.msg+1, KERNEL_TAG);
+
+        if (oneline_len > LOGGER_ENTRY_MAX_PAYLOAD - sizeof(KERNEL_TAG) - 2) {
+            oneline_len = LOGGER_ENTRY_MAX_PAYLOAD - sizeof(KERNEL_TAG) - 2;
+        }
+
+        strncpy(entry->entry.msg + 1 + sizeof(KERNEL_TAG), begin, oneline_len);
+        entry->entry.len = 1 + sizeof(KERNEL_TAG) + oneline_len + 1;
+        entry->entry.msg[entry->entry.len] = '\0';
+        dev->enqueue(entry);
+        ++queued_lines;
+
+        if (oneline_len < LOGGER_ENTRY_MAX_PAYLOAD - sizeof(KERNEL_TAG) - 2) {
+            begin = begin + oneline_len + 1;
+        } else {
+            begin = begin + oneline_len;
+        }
+    } while ( '\0' != *begin );
+
+    return queued_lines;
+}
+
+static void readLogLines(log_device_t* devices, bool kmsg)
 {
     log_device_t* dev;
     int max = 0;
@@ -257,10 +398,16 @@ static void readLogLines(log_device_t* devices)
 
     int result;
     fd_set readset;
+    char buffer[256] = {0};
 
     for (dev=devices; dev; dev = dev->next) {
         if (dev->fd > max) {
             max = dev->fd;
+        }
+
+        //Also print kernel message when user request log of main ring buffer
+        if ( 'm' == dev->label && kmsg) {
+            queued_lines = importKernelMessage(dev, true);
         }
     }
 
@@ -306,6 +453,11 @@ static void readLogLines(log_device_t* devices)
 
                     dev->enqueue(entry);
                     ++queued_lines;
+                    
+                    //Also print kernel msg with log of main ring buffer
+                    if(dev->label == 'm' && kmsg) {
+                        queued_lines += importKernelMessage(dev, false);
+                    }
                 }
             }
 
@@ -404,6 +556,7 @@ static void show_help(const char *cmd)
                     "  -v <format>     Sets the log print format, where <format> is one of:\n\n"
                     "                  brief process tag thread raw time threadtime long\n\n"
                     "  -c              clear (flush) the entire log and exit\n"
+                    "  -k              enable kernel log, this is enabled by default\n"
                     "  -d              dump the log and then exit (don't block)\n"
                     "  -t <count>      print only the most recent <count> lines (implies -d)\n"
                     "  -g              get the size of the log's ring buffer and exit\n"
@@ -471,6 +624,7 @@ int main(int argc, char **argv)
     log_device_t* devices = NULL;
     log_device_t* dev;
     bool needBinary = false;
+    bool enableKernelMsg = true;    // Enable kernel log by default
 
     g_logformat = android_log_format_new();
 
@@ -487,7 +641,7 @@ int main(int argc, char **argv)
     for (;;) {
         int ret;
 
-        ret = getopt(argc, argv, "cdt:gsQf:r::n:v:b:BC");
+        ret = getopt(argc, argv, "kcdt:gsQf:r::n:v:b:BC");
 
         if (ret < 0) {
             break;
@@ -499,6 +653,9 @@ int main(int argc, char **argv)
                 android_log_addFilterRule(g_logformat, "*:s");
             break;
 
+            case 'k':
+                enableKernelMsg = true;
+            break;
             case 'c':
                 clearLog = 1;
                 mode = O_WRONLY;
@@ -753,6 +910,12 @@ int main(int argc, char **argv)
                 perror("ioctl");
                 exit(EXIT_FAILURE);
             }
+
+            //Also clear kernel ring buffer when clear main ring buffer
+            if ( 'm' == dev->label && klogctl(KLOG_CLEAR, NULL, 0) == -1 ) {
+                perror("klogctl");
+                exit(EXIT_FAILURE);
+            }
         }
 
         if (getLogSize) {
@@ -793,7 +956,7 @@ int main(int argc, char **argv)
     if (needBinary)
         android::g_eventTagMap = android_openEventTagMap(EVENT_TAG_MAP_FILE);
 
-    android::readLogLines(devices);
+    android::readLogLines(devices, enableKernelMsg);
 
     return 0;
 }
